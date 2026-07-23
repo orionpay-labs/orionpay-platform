@@ -100,6 +100,21 @@ Payload de exemplo:
 
 Resposta para uma nova solicitação aceita: `202 Accepted`.
 
+Payload de Resposta `PaymentResponse`:
+
+```json
+{
+   "paymentId": "9f27d8c1-63b4-4a0e-a7dc-2e914f6b8053",
+   "merchantReference": "order-123",
+   "amount": 10990,
+   "currency": "BRL",
+   "paymentMethodToken": "tok_test_visa",
+   "status": "PENDING",
+   "createdAt": "2026-07-23T14:00:00Z"
+}
+```
+
+
 Resposta para replay equivalente: `200 OK`, header `Idempotent-Replayed: true` e representação atual do mesmo pagamento.
 
 Resposta para a mesma chave com payload diferente: `409 Conflict`, código `IDEMPOTENCY_KEY_REUSED`.
@@ -144,10 +159,32 @@ Transições permitidas:
 
 ```text
 PENDING -> PROCESSING
-PENDING -> FAILED
 PROCESSING -> PROCESSING
 PROCESSING -> SUCCEEDED
 PROCESSING -> FAILED
+```
+
+O pagamento só chega a FAILED quando o provedor devolve um resultado terminal comprovado:
+
+```
+PENDING
+|
+v
+PROCESSING
+|       \
+v        v
+SUCCEEDED  FAILED
+```
+
+Payload de exemplo para `FAILED`:
+
+```json
+{
+  "paymentId": "9f27d8c1-63b4-4a0e-a7dc-2e914f6b8053",
+  "status": "FAILED",
+  "reasonCode": "PROVIDER_DECLINED",
+  "message": "Payment was declined."
+}
 ```
 
 Uma atualização repetida para o mesmo estado é tratada como no-op idempotente quando os dados não conflitam. Estados terminais não voltam a estados não terminais. Atualizações usarão `version`/compare-and-set ou predicado sobre o estado atual, impedindo que respostas atrasadas sobrescrevam um resultado terminal.
@@ -224,7 +261,126 @@ A correção não dependerá de uma checagem "consultar e depois inserir", pois 
 
 ### 7.4 Despacho ao provedor
 
-1. O worker seleciona eventos disponíveis usando locking com `FOR UPDATE SKIP LOCKED` ou lease equivalente.
+1. Worker: A ideia central é dividir o trabalho em duas transações curtas, com a chamada HTTP fora delas:
+```
+Transação 1: reivindicar trabalho
+        ↓ commit
+Sem transação: chamar provedor
+        ↓
+Transação 2: registrar resultado
+```
+
+Se mantivéssemos FOR UPDATE durante a chamada HTTP, uma lentidão do provedor manteria conexão e lock do PostgreSQL ocupados, causando contenção e possivelmente esgotando o pool.
+
+`Worker reivindica o evento`
+
+Em uma transação curta:
+
+```sql
+SELECT *
+FROM outbox_events
+WHERE status IN ('PENDING', 'RETRY')
+  AND available_at <= now()
+  AND (lease_until IS NULL OR lease_until < now())
+FOR UPDATE SKIP LOCKED
+LIMIT 1;
+```
+
+O worker atualiza o registro:
+```
+status        = IN_PROGRESS
+lease_owner   = worker-17
+lease_token   = UUID aleatório
+lease_until   = agora + 60 segundos
+attempt_count = attempt_count + 1
+```
+
+Também cria uma tentativa com estado STARTED e muda o pagamento de PENDING para PROCESSING, caso ainda esteja pendente.
+Em seguida, faz commit. O FOR UPDATE termina aqui.
+O lease_token identifica aquela aquisição específica. Mesmo o mesmo worker receberá outro token se adquirir novamente o evento.
+
+`Chamada ao provedor sem transação`
+
+Depois do commit:
+`OrionPay -> HTTP -> provedor simulado`
+
+A chamada utiliza:
+`providerIdempotencyKey = paymentId`
+
+O timeout HTTP deve ser menor que o lease. Por exemplo:
+
+`Timeout HTTP: 10 segundos`
+`Lease: 60 segundos`
+
+Assim, normalmente o worker recebe sucesso, recusa ou timeout antes de perder o lease.
+
+
+`Worker persiste o resultado`
+
+Ao receber a resposta, abre uma nova transação e verifica se ainda é o proprietário:
+
+```sql
+UPDATE outbox_events
+SET ...
+WHERE id = :eventId
+  AND status = 'IN_PROGRESS'
+  AND lease_token = :originalLeaseToken;
+```
+
+Se nenhuma linha for afetada, o lease já foi adquirido por outro worker. A resposta é considerada atrasada e esse worker não modifica o pagamento.
+
+Sucesso confirmado
+
+```
+payment: PROCESSING -> SUCCEEDED
+attempt: STARTED -> SUCCEEDED
+outbox:  IN_PROGRESS -> DONE
+```
+
+Recusa definitiva
+
+```
+payment: PROCESSING -> FAILED
+attempt: STARTED -> DECLINED
+outbox:  IN_PROGRESS -> DONE
+reasonCode: PROVIDER_DECLINED
+```
+
+Timeout ou erro temporário
+
+```
+payment: continua PROCESSING
+attempt: STARTED -> UNKNOWN ou RETRYABLE_ERROR
+outbox:  IN_PROGRESS -> RETRY
+available_at: agora + backoff
+lease_token: removido
+lease_until: removido
+```
+
+O que acontece se o worker morrer?
+
+| Momento do crash | Recuperação |
+|---|---|
+| Antes do primeiro commit | Nenhum lease foi adquirido; outro worker seleciona o evento. |
+| Depois do commit, antes do HTTP | O lease expira e outro worker assume. |
+| Durante o HTTP | O lease expira; a próxima tentativa usa a mesma chave idempotente. |
+| Depois de o provedor cobrar, antes do segundo commit | Outro worker consulta ou repete com a mesma chave; o provedor devolve a operação original. |
+| Worker antigo retorna depois da reaquisição | O `lease_token` não corresponde mais; a resposta atrasada não é aplicada. |
+
+O SKIP LOCKED impede que dois workers adquiram simultaneamente o registro. O lease permite recuperação após o commit. O lease_token impede que um worker antigo aplique uma resposta depois de perder a posse.
+Para o pagamento, use também uma atualização condicional:
+
+```sql
+UPDATE payments
+SET status = 'SUCCEEDED',
+    version = version + 1
+WHERE id = :paymentId
+  AND status = 'PROCESSING'
+  AND version = :expectedVersion;
+```
+Estados terminais nunca são sobrescritos.
+   
+
 2. O pagamento passa de `PENDING` para `PROCESSING`.
 3. Toda chamada usa uma chave derivada estável do `paymentId`; retries nunca geram uma nova chave de cobrança.
 4. Em sucesso ou recusa confirmada, a transição terminal e o encerramento do evento são persistidos.
