@@ -327,13 +327,18 @@ Assim, normalmente o worker recebe sucesso, recusa ou timeout antes de perder o 
 
 `Worker persiste o resultado`
 
+Na segunda transação, a atualização da tentativa, a transição de estado do pagamento e a atualização do evento da outbox são realizadas atomicamente. 
+A aplicação primeiro valida a posse do evento usando o lease_token e o prazo do lease. 
+Se a posse for válida, as três alterações são persistidas no mesmo commit. Se qualquer atualização falhar, toda a transação sofre rollback.
+Caso o lease tenha expirado ou o token não corresponda, nenhuma das três entidades é modificada.
+
 Ao receber a resposta, abre uma nova transação e verifica se ainda é o proprietário:
 
 Política (a), o worker só pode gravar enquanto o lease ainda estiver válido:
 
 ```sql
 UPDATE outbox_events
-SET status = 'PROCESSED',
+SET status = 'DONE',
     processed_at = now(),
     lease_until = NULL
 WHERE id = :eventId
@@ -506,6 +511,20 @@ Usar PostgreSQL real via Testcontainers, evitando depender de diferenças de com
 - indisponibilidade temporária do banco;
 - recuperação de evento/lease abandonado;
 - ausência de informações sensíveis em banco, respostas e logs.
+
+### Testes de Recuperação de Envento/lease Abandonado
+
+- `Lease expirado sem reaquisição`: verificar que o worker antigo não consegue persistir o resultado depois de lease_until, mesmo que o lease_token ainda não tenha sido alterado.
+- `Evento reaquirido por outro worker`: verificar que o novo worker recebe outro lease_token e que uma resposta atrasada do worker anterior não modifica tentativa, pagamento nem outbox.
+
+Possíveis nomes:
+```java
+shouldRejectResultWhenLeaseHasExpired()
+shouldRejectStaleWorkerAfterEventIsReacquired()
+```
+
+Esses testes comprovam especificamente a política (a) escolhida no documento.
+
 
 ### Testes de contrato
 
