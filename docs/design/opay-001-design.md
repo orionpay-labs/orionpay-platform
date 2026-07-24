@@ -100,7 +100,7 @@ Payload de exemplo:
 
 Resposta para uma nova solicitação aceita: `202 Accepted`.
 
-Payload de Resposta `PaymentResponse`:
+Payload de Resposta `PaymentResponse`, valido para POST, replay e GET:
 
 ```json
 {
@@ -108,9 +108,9 @@ Payload de Resposta `PaymentResponse`:
    "merchantReference": "order-123",
    "amount": 10990,
    "currency": "BRL",
-   "paymentMethodToken": "tok_test_visa",
    "status": "PENDING",
-   "createdAt": "2026-07-23T14:00:00Z"
+   "createdAt": "2026-07-23T14:00:00Z",
+   "updatedAt": "2026-07-23T14:00:00Z"
 }
 ```
 
@@ -279,11 +279,21 @@ Em uma transação curta:
 ```sql
 SELECT *
 FROM outbox_events
-WHERE status IN ('PENDING', 'RETRY')
-  AND available_at <= now()
-  AND (lease_until IS NULL OR lease_until < now())
-FOR UPDATE SKIP LOCKED
-LIMIT 1;
+WHERE available_at <= now()
+  AND (
+   (
+      status IN ('PENDING', 'RETRY')
+         AND (lease_until IS NULL OR lease_until <= now())
+      )
+      OR
+   (
+      status = 'IN_PROGRESS'
+         AND lease_until <= now()
+      )
+   )
+ORDER BY available_at, id
+   LIMIT 1
+FOR UPDATE SKIP LOCKED;
 ```
 
 O worker atualiza o registro:
@@ -324,6 +334,7 @@ UPDATE outbox_events
 SET ...
 WHERE id = :eventId
   AND status = 'IN_PROGRESS'
+  AND lease_until <= now()
   AND lease_token = :originalLeaseToken;
 ```
 
