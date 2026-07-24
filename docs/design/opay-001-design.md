@@ -329,13 +329,41 @@ Assim, normalmente o worker recebe sucesso, recusa ou timeout antes de perder o 
 
 Ao receber a resposta, abre uma nova transação e verifica se ainda é o proprietário:
 
+Política (a), o worker só pode gravar enquanto o lease ainda estiver válido:
+
 ```sql
 UPDATE outbox_events
-SET ...
+SET status = 'PROCESSED',
+    processed_at = now(),
+    lease_until = NULL
 WHERE id = :eventId
   AND status = 'IN_PROGRESS'
-  AND lease_until <= now()
+  AND lease_token = :originalLeaseToken
+  AND lease_until > now();
+```
+
+Política (b), o lease expirado não invalida automaticamente o worker antigo. 
+Ele ainda pode concluir enquanto nenhum outro worker tiver reaquiriu o evento e alterado o 
+lease_token:
+
+O UPDATE de conclusão não verifica lease_until:
+```sql
+UPDATE outbox_events
+SET status = 'PROCESSED',
+    processed_at = now(),
+    lease_until = NULL
+WHERE id = :eventId
+  AND status = 'IN_PROGRESS'
   AND lease_token = :originalLeaseToken;
+```
+A reaquisição continua exigindo lease expirado e gera um token novo:
+```sql
+UPDATE outbox_events
+SET lease_until = now() + INTERVAL '30 seconds',
+    lease_token = gen_random_uuid()
+WHERE id = :eventId
+  AND status = 'IN_PROGRESS'
+  AND lease_until <= now();
 ```
 
 Se nenhuma linha for afetada, o lease já foi adquirido por outro worker. A resposta é considerada atrasada e esse worker não modifica o pagamento.
