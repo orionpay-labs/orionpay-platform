@@ -515,7 +515,7 @@ Usar PostgreSQL real via Testcontainers, evitando depender de diferenças de com
 ### Testes de Recuperação de Envento/lease Abandonado
 
 - `Lease expirado sem reaquisição`: verificar que o worker antigo não consegue persistir o resultado depois de lease_until, mesmo que o lease_token ainda não tenha sido alterado.
-- `Evento reaquirido por outro worker`: verificar que o novo worker recebe outro lease_token e que uma resposta atrasada do worker anterior não modifica tentativa, pagamento nem outbox.
+- `Evento reaquirido por outro worker`: verificar que o novo worker recebe outro lease_token e que uma resposta atrasada do worker anterior não modifica tentativa, pagamento nem outbox, o novo worker também consegue concluir a tarefa usando o novo lease_token.
 
 Possíveis nomes:
 ```java
